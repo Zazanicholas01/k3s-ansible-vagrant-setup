@@ -1,0 +1,16 @@
+    - name: Flux bootstrap (GitHub)
+      when: node_role == "server" and (flux_install | default(true) | bool)
+      become: false
+      no_log: true
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        export GITHUB_TOKEN='{{ flux_github_token }}'
+        flux bootstrap github \
+          --owner='{{ flux_github_owner }}' \
+          --repository='{{ flux_github_repository }}' \
+          --branch='{{ flux_github_branch }}' \
+          --path='{{ flux_github_path }}' \
+          --personal={{ flux_github_personal | default(true) | bool | ternary('true','false') }}
+      args:
+        executable: /bin/bash

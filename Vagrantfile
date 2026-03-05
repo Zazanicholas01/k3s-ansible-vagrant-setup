@@ -14,6 +14,7 @@ Vagrant.configure("2") do |config|
             a.playbook = "/vagrant/ansible/site.yaml"
             a.install = true
             a.install_mode = "pip"
+            a.raw_arguments = ["--vault-password-file=/vagrant/ansible/.vault_pass"]
             a.extra_vars = {
                 "node_role" => "server",
                 "control_plane_ip" => "192.168.56.10"

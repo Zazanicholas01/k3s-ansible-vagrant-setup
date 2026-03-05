@@ -1,0 +1,290 @@
+- name: Install and configure K3s + Cilium on this node
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    ansible_connection: local
+
+    # ----- Cilium LB replace MetalLB ----
+    cilium_kube_proxy_replacement: true
+    cilium_lb_pool_start: "192.168.56.240"
+    cilium_lb_pool_stop: "192.168.56.250"
+    cilium_l2_interfaces_regex: "^enp0s8$" # change to match your VM NIC (often enp0s8 or eth1)
+
+  tasks:
+    - name: Show role
+      debug:
+        msg: "role={{ node_role }} hostname={{ ansible_hostname }} control_plane_ip={{ control_plane_ip }}"
+
+    - name: Pick node IP on host-only network
+      set_fact:
+        node_ip_candidates: "{{ ansible_all_ipv4_addresses | select('match', '^' ~ (hostonly_cidr_prefix | regex_escape()) ) | list | unique }}"
+
+    - name: Set node_ip from candidates
+      set_fact:
+        node_ip: "{{ node_ip_candidates[0] }}"
+      when: node_ip_candidates | length > 0
+
+    - name: Fallback to ansible_default_ipv4.address if no 192.168.56.x found
+      set_fact:
+        node_ip: "{{ ansible_default_ipv4.address }}"
+      when: node_ip is not defined
+
+    - name: Debug chosen node_ip + all addresses
+      debug:
+        msg: "node_ip={{ node_ip }} candidates={{ node_ip_candidates | default([]) }} all={{ ansible_all_ipv4_addresses }}"
+
+    # --- Base sysctls ---
+    - name: Kernel modules config
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+    
+    - name: Load modules now
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
+    
+    - name: Sysctl config
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+    
+    - name: Apply sysctl
+      command: sysctl --system
+    
+    - name: Install base packages
+      apt:
+        update_cache: true
+        name:
+          - curl
+          - ca-certificates
+          - apt-transport-https
+          - gnupg
+          - netcat-openbsd
+        state: present
+
+# ===========================================
+# K3S Server Control Plane
+# ===========================================
+
+    - name: Install K3s Server 
+      when: node_role == "server"
+      shell: |
+        set -euo pipefail
+
+        DISABLE_KP=""
+        if [ "{{ cilium_kube_proxy_replacement | bool }}" = "True" ]; then
+          DISABLE_KP="--disable-kube-proxy"
+        fi
+
+        curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL="{{ k3s_channel }}" \
+          INSTALL_K3S_EXEC="server \
+            --node-ip={{ control_plane_ip }} \
+            --node-external-ip={{ node_ip }} \
+            --tls-san={{ control_plane_ip }} \
+            --flannel-backend=none \
+            --disable=servicelb \
+            --disable-network-policy \
+            --disable=traefik \
+            $DISABLE_KP" sh -
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/k3s
+    
+    - name: Copy kubeconfig for vagrant user
+      when: node_role == "server"
+      shell: |
+        set -euo pipefail
+
+        mkdir -p /home/vagrant/.kube
+        cp -f /etc/rancher/k3s/k3s.yaml /home/vagrant/.kube/config
+        chown -R vagrant:vagrant /home/vagrant/.kube
+        sed -i 's/127.0.0.1/{{ control_plane_ip }}/g' /home/vagrant/.kube/config
+      args:
+        executable: /bin/bash
+        creates: /home/vagrant/.kube/config
+
+    - name: Wait for API Server on port 6443
+      when: node_role == "server"
+      shell: |
+        set -e
+        timeout 180 bash -c 'until nc -z 127.0.0.1 6443; do sleep 2; done'
+      args:
+        executable: /bin/bash
+    
+    - name: Wait for Kubernetes apiserver /readyz to succeed
+      when: node_role == "server"
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        timeout 300 bash -c 'until k3s kubectl get --raw=/readyz >/dev/null 2>&1; do sleep 2; done'
+      args:
+        executable: /bin/bash
+
+    - name: Write K3s node token to shared folder
+      when: node_role == "server"
+      shell: |
+        set -euo pipefail
+        cat /var/lib/rancher/k3s/server/node-token > {{ k3s_token_path }}
+        chmod 0644 {{ k3s_token_path }}
+      args:
+        executable: /bin/bash
+        creates: "{{ k3s_token_path }}"
+
+# =======================================================================
+# Install Helm and Cilium
+# =======================================================================
+
+    - name: Install Helm
+      when: node_role == "server"
+      shell: |
+        set -euo pipefail
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/helm
+
+    - name: Install Cilium via Helm
+      when: node_role == "server"
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+
+        helm repo add cilium {{ cilium_helm_repo }}
+        helm repo update
+
+        VER=""
+        if [ -n "{{ cilium_version }}" ]; then
+          VER="--version {{ cilium_version }}"
+        fi
+
+        KPR="disabled"
+        if [ "{{ cilium_kube_proxy_replacement | bool }}" = "True" ]; then
+          KPR="true"
+        fi
+
+        for i in $(seq 1 30); do
+          helm upgrade --install cilium cilium/cilium \
+            --namespace kube-system --create-namespace \
+            $VER \
+            --set k8sServiceHost={{ control_plane_ip }} \
+            --set k8sServicePort=6443 \
+            --set kubeProxyReplacement=$KPR \
+            --set l2announcements.enabled=true \
+            --set operator.replicas=1 && exit 0
+          sleep 5
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+      register: cilium_install
+      changed_when: "'deployed' in cilium_install.stdout or 'installed' in cilium_install.stdout or 'upgraded' in cilium_install.stdout"
+
+    - name: Wait for Cilium to be ready
+      when: node_role == "server"
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        k3s kubectl -n kube-system rollout status ds/cilium --timeout=3600s
+        k3s kubectl -n kube-system rollout status ds/cilium-envoy --timeout=3600s
+        k3s kubectl -n kube-system rollout status deploy/cilium-operator --timeout=600s
+      args:
+        executable: /bin/bash
+    
+    - name: Configure Cilium LoadBalancer IP pool + L2 announcement policy
+      when: node_role == "server"
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+
+        cat <<'YAML' | k3s kubectl apply -f -
+        apiVersion: cilium.io/v2alpha1
+        kind: CiliumLoadBalancerIPPool
+        metadata:
+          name: vagrant-pool
+        spec:
+          blocks:
+            - start: "{{ cilium_lb_pool_start }}"
+              stop: "{{ cilium_lb_pool_stop }}"
+        ---
+        apiVersion: cilium.io/v2alpha1
+        kind: CiliumL2AnnouncementPolicy
+        metadata:
+          name: vagrant-l2
+        spec:
+          interfaces:
+            - "{{ cilium_l2_interfaces_regex }}"
+          loadBalancerIPs: true
+          externalIPs: true
+        YAML
+      args:
+        executable: /bin/bash
+      register: cilium_lb_cfg
+      changed_when: "'configured' in cilium_lb_cfg.stdout or 'created' in cilium_lb_cfg.stdout"
+
+# ===================================================
+# Install Flux CD
+# ===================================================
+
+    - name: Install Flux CLI
+      when: node_role == "server" and (flux_install | default(true) | bool)
+      shell: |
+        set -euo pipefail
+        curl -fsSL https://fluxcd.io/install.sh | bash
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/flux
+    
+    - name: Check if flux-system namespace exists
+      when: node_role == "server" and (flux_install | default(true) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        k3s kubectl get ns flux-system -o name
+      args:
+        executable: /bin/bash
+      register: flux_ns
+      failed_when: false
+      changed_when: false
+    
+    - name: Install Flux controllers into the cluster
+      when: node_role == "server" and (flux_install | default(true) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        flux install {{ flux_install_args | default('') }}
+      args:
+        executable: /bin/bash
+    
+    - name: Wait for Flux controllers to be ready
+      when: node_role == "server" and (flux_install | default(true) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        k3s kubectl -n flux-system rollout status deploy/source-controller --timeout=600s
+        k3s kubectl -n flux-system rollout status deploy/kustomize-controller --timeout=600s
+        k3s kubectl -n flux-system rollout status deploy/helm-controller --timeout=600s
+        k3s kubectl -n flux-system rollout status deploy/notification-controller --timeout=600s
+      args:
+        executable: /bin/bash
+    
+    - name: Install Git
+      when: node_role == "server" and (flux_install | default(true) | bool)
+      apt:
+        update_cache: true
+        name: git
+        state: present
+    

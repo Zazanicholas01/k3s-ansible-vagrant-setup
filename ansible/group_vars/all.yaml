@@ -1,31 +1,75 @@
+#### Global variable configuration
+
 k3s_channel: "stable"
 k3s_server_url: "https://{{ control_plane_ip }}:6443"
 hostonly_cidr_prefix: "192.168.56."
 
-# Scambio token via cartella condivisa
+#### Disk configuration variables
+
+k3s_data_disk_device: "/dev/sdc"
+k3s_data_partition: "/dev/sdc1"
+k3s_data_mount: "/srv/k3s-data"
+k3s_data_dir: "/srv/k3s-data/rancher"
+longhorn_data_dir: "/srv/k3s-data/longhorn"
+
+#### Scambio token via cartella condivisa
 k3s_token_path: "/vagrant/k3s_node_token"
 
-# Cilium
+#### Cilium
 cilium_version: ""
 cilium_helm_repo: "https://helm.cilium.io/"
 
-# Flux CD
-flux_install: true
+#### Flux CD
+flux_install: false
 
-# flux_bootstrap: true
-# flux_github_owner: "Zazanicholas01"
-# flux_github_repository: "Gitops_Homelab"
-# flux_github_branch: "main"
-# flux_github_path: "clusters/k3s"
-# flux_github_personal: true
-# flux_github_token: !vault |
-#   $ANSIBLE_VAULT;1.1;AES256
-#   64623162326462316537303537323634363761633765653262303063613435666466623131666637
-#   3335656539363566346238333365663832353135656130390a396462633564336136656166653661
-#   66383937393763313736623139363762623930333833356530343466646236656363303934626237
-#   6131323565333964390a626662346136626565656463333333346463656464393535343931636137
-#   64363161323430386362336234346430323432363233313330303265363139303737376436396238
-#   35383361393764656132653962303664653438653761623433323936383534376335333136323463
-#   61313361623832393638656662623565363739646436376166633837356339393736383634626334
-#   62373339313835616637376138363732393364393734303434393332663566363163656430323238
-#   3638
+#### Longhorn
+longhorn_install: true
+longhorn_namespace: longhorn-system
+longhorn_helm_repo: "https://charts.longhorn.io"
+longhorn_chart_version: ""
+longhorn_default_data_path: "/srv/k3s-data/longhorn"
+longhorn_default_replica_count: 1
+
+#### Cert Manager
+cert_manager_install: true
+cert_manager_namespace: cert-manager
+cert_manager_helm_repo: "https://charts.jetstack.io"
+cert_manager_chart_version: ""
+cert_manager_install_crds: true
+
+#### NGINX Gateway
+nginx_gateway_install: true
+nginx_gateway_namespace: nginx-gateway
+nginx_gateway_helm_repo: "oci://ghcr.io/nginx/charts/nginx-gateway-fabric"
+nginx_gateway_chart_version: "2.4.2"
+nginx_gateway_crd_version: "v2.4.2"
+
+#### Manifests Copy
+manifests_copy_to_vm: true
+manifests_source_dir: "/vagrant/manifests"
+manifests_dest_dir: "/home/vagrant/manifests"
+
+#### Starship Shell
+starship_install: true
+starship_config_source: "/vagrant/starship.toml"
+starship_config_dest: "/home/vagrant/.config/starship.toml"
+
+#### Quality of Life
+shell_qol_install: true
+kubectx_install: true
+
+#### Github deploy key / repo bootstrap
+github_repo_clone: true
+github_repo_ssh_url: "git@github.com:zazanicholas01/filebrowser-homelab.git"
+github_repo_dest: "/home/vagrant/repo"
+github_repo_branch: "main"
+
+github_deploy_key_name: "id_github_repo"
+github_deploy_key_path: "/home/vagrant/.ssh/id_github_repo"
+
+git_user_name: "Zazanicholas01"
+git_user_email: "matteoesposito12.me@gmail.com"
+
+gitops_repo_layout_init: true
+gitops_cluster_dir: "/home/vagrant/repo/clusters/k3s"
+gitops_sync_manifests: true

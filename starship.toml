@@ -1,0 +1,57 @@
+palette = "my_custom_theme"
+
+format = """
+[](fg:bg_dir)\
+$directory\
+[](fg:bg_dir bg:bg_git)\
+$git_branch\
+$git_status\
+[](fg:bg_git bg:bg_k8s)\
+$kubernetes\
+[](fg:bg_k8s bg:bg_py)\
+$python\
+[](fg:bg_py)\
+$character"""
+
+[directory]
+# Added 'bold' here
+style = "bold bg:bg_dir fg:fg_light"
+format = "[ $path ]($style)"
+truncation_length = 3
+
+[git_branch]
+symbol = " "
+# Added 'bold' here
+style = "bold bg:bg_git fg:fg_dark"
+format = "[[ $symbol $branch ]($style)]($style)"
+
+[git_status]
+# Keep status normal or bold depending on preference; here it matches the branch
+style = "bold bg:bg_git fg:fg_dark"
+format = "[[($all_status$ahead_behind )]($style)]($style)"
+
+[kubernetes]
+symbol = "󱃾 "
+disabled = false
+# Added 'bold' here
+style = "bold bg:bg_k8s fg:fg_dark"
+format = '[[ $symbol $context ($namespace) ]($style)]($style)'
+
+[python]
+symbol = " "
+style = "bold bg:bg_py fg:fg_dark"
+# Use single quotes to allow Starship's \( escape for literal parentheses
+format = '[[ $symbol ($version) ( \($virtualenv\)) ]($style)]($style)'
+
+[character]
+success_symbol = "[ ❯ ](bold green)"
+error_symbol = "[ ❯ ](bold red)"
+
+# --- PALETTE DEFINITION ---
+[palettes.my_custom_theme]
+bg_dir   = "#2c3b5c" # Dark Grey
+bg_git   = "#f8b46c" # Orange/Gold (formerly Python)
+bg_k8s   = "#3f96fa" # Ice Blue
+bg_py    = "#51f066" # Light Green
+fg_light = "#ECEFF4" # Off-white text
+fg_dark  = "#2E3440" # Near-black text

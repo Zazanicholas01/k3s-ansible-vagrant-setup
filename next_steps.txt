@@ -1,0 +1,28 @@
+
+
+    - IDENTITY AND ACCESS
+
+        - Authelia / Authentik
+    
+    - DNS & TLS SETUP
+
+        - Local only with self-signed / internal CA
+        - LAN only with split DNS
+        - Public with real domain and ACME
+    
+    - Storage Policy
+
+        - PVC size
+        - Backup / Snapshots Policies
+    
+    - Backups
+
+        - Longhorn snapshots/Backup
+        - App config backup
+        - GitOps repo backup
+    
+    - Services
+
+        - Homepage for admin dashboard
+        - Promethues + Grafana for metrics + Loki + Alloy
+    

@@ -14,29 +14,35 @@
 
   tasks:
     - name: Show role
+      tags: [base]
       debug:
         msg: "role={{ node_role }} hostname={{ ansible_hostname }} control_plane_ip={{ control_plane_ip }}"
 
     - name: Pick node IP on host-only network
+      tags: [base]
       set_fact:
         node_ip_candidates: "{{ ansible_all_ipv4_addresses | select('match', '^' ~ (hostonly_cidr_prefix | regex_escape()) ) | list | unique }}"
 
     - name: Set node_ip from candidates
+      tags: [base]
       set_fact:
         node_ip: "{{ node_ip_candidates[0] }}"
       when: node_ip_candidates | length > 0
 
     - name: Fallback to ansible_default_ipv4.address if no 192.168.56.x found
+      tags: [base]
       set_fact:
         node_ip: "{{ ansible_default_ipv4.address }}"
       when: node_ip is not defined
 
     - name: Debug chosen node_ip + all addresses
+      tags: [base]
       debug:
         msg: "node_ip={{ node_ip }} candidates={{ node_ip_candidates | default([]) }} all={{ ansible_all_ipv4_addresses }}"
 
     # --- Base sysctls ---
     - name: Kernel modules config
+      tags: [base]
       copy:
         dest: /etc/modules-load.d/k8s.conf
         content: |
@@ -44,11 +50,13 @@
           br_netfilter
     
     - name: Load modules now
+      tags: [base]
       shell: |
         modprobe overlay
         modprobe br_netfilter
     
     - name: Sysctl config
+      tags: [base]
       copy:
         dest: /etc/sysctl.d/k8s.conf
         content: |
@@ -57,9 +65,11 @@
           net.ipv4.ip_forward = 1
     
     - name: Apply sysctl
+      tags: [base]
       command: sysctl --system
     
     - name: Install base packages
+      tags: [base]
       apt:
         update_cache: true
         name:
@@ -70,11 +80,142 @@
           - netcat-openbsd
         state: present
 
+    - name: Add DNS servers to netplan for enp0s3
+      tags: [base]
+      become: true
+      copy:
+        dest: /etc/netplan/60-dns-enp0s3.yaml
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          network:
+            version: 2
+            ethernets:
+              enp0s3:
+                nameservers:
+                  addresses:
+                    - 1.1.1.1
+                    - 8.8.8.8
+      notify: Apply netplan
+
+    - name: Apply Netplan
+      tags: [base]
+      become: true
+      command: netplan apply
+
+# ===========================================
+# Disk / Partition Configuration
+# ===========================================
+
+    - name: Install disk utility packages
+      tags: [base]
+      apt:
+        update_cache: true
+        name:
+          - parted
+          - e2fsprogs
+          - util-linux
+        state: present
+
+    - name: Wait for extra data disk to appear
+      tags: [base]
+      shell: |
+        set -euo pipefail
+        for i in $(seq 1 30); do
+          [ -b "{{ k3s_data_disk_device }}" ] && exit 0
+          sleep 2
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+
+    - name: Check whether data partition already exists
+      tags: [base]
+      stat:
+        path: "{{ k3s_data_partition }}"
+      register: data_partition_stat
+
+    - name: Create GPT partition on data disk if missing
+      tags: [base]
+      shell: |
+        set -euo pipefail
+        parted -s "{{ k3s_data_disk_device }}" mklabel gpt
+        parted -s "{{ k3s_data_disk_device }}" mkpart primary ext4 1MiB 100%
+        partprobe "{{ k3s_data_disk_device }}"
+        udevadm settle
+        sleep 2
+      args:
+        executable: /bin/bash
+      when: not data_partition_stat.stat.exists
+
+    - name: Check filesystem type on data partition
+      tags: [base]
+      shell: |
+        set -euo pipefail
+        blkid -o value -s TYPE "{{ k3s_data_partition }}" || true
+      register: data_partition_fstype
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: Wipe old filesystem signatures if partition exists but is not ext4
+      tags: [base]
+      shell: |
+        set -euo pipefail
+        wipefs -a "{{ k3s_data_partition }}"
+        udevadm settle
+        sleep 2
+      args:
+        executable: /bin/bash
+      when:
+        - data_partition_stat.stat.exists
+        - data_partition_fstype.stdout | trim != "ext4"
+
+    - name: Create ext4 filesystem on data partition if missing
+      tags: [base]
+      shell: |
+        set -euo pipefail
+        mkfs.ext4 -F "{{ k3s_data_partition }}"
+        udevadm settle
+        sleep 2
+      args:
+        executable: /bin/bash
+      when: data_partition_fstype.stdout | trim != "ext4"
+
+    - name: Ensure data mountpoint exists
+      tags: [base]
+      file:
+        path: "{{ k3s_data_mount }}"
+        state: directory
+        mode: "0755"
+
+    - name: Mount data disk
+      tags: [base]
+      mount:
+        path: "{{ k3s_data_mount }}"
+        src: "{{ k3s_data_partition }}"
+        fstype: ext4
+        opts: defaults,noatime
+        state: mounted
+
+    - name: Ensure k3s and Longhorn data directories exist
+      tags: [base]
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ k3s_data_dir }}"
+        - "{{ longhorn_default_data_path }}"
+
+
 # ===========================================
 # K3S Server Control Plane
 # ===========================================
 
     - name: Install K3s Server 
+      tags: [base]
       when: node_role == "server"
       shell: |
         set -euo pipefail
@@ -86,6 +227,8 @@
 
         curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL="{{ k3s_channel }}" \
           INSTALL_K3S_EXEC="server \
+            --cluster-init \
+            --data-dir={{ k3s_data_dir }} \
             --node-ip={{ control_plane_ip }} \
             --node-external-ip={{ node_ip }} \
             --tls-san={{ control_plane_ip }} \
@@ -99,6 +242,7 @@
         creates: /usr/local/bin/k3s
     
     - name: Copy kubeconfig for vagrant user
+      tags: [base]
       when: node_role == "server"
       shell: |
         set -euo pipefail
@@ -112,6 +256,7 @@
         creates: /home/vagrant/.kube/config
 
     - name: Wait for API Server on port 6443
+      tags: [base]
       when: node_role == "server"
       shell: |
         set -e
@@ -120,6 +265,7 @@
         executable: /bin/bash
     
     - name: Wait for Kubernetes apiserver /readyz to succeed
+      tags: [base]
       when: node_role == "server"
       shell: |
         set -euo pipefail
@@ -129,6 +275,7 @@
         executable: /bin/bash
 
     - name: Write K3s node token to shared folder
+      tags: [base]
       when: node_role == "server"
       shell: |
         set -euo pipefail
@@ -143,7 +290,13 @@
 # =======================================================================
 
     - name: Install Helm
-      when: node_role == "server"
+      tags: [platform, addons]
+      when: node_role == "server" and (
+              (cilium_install | default(false) | bool) or
+              (longhorn_install | default(false) | bool) or
+              (cert_manager_install | default(false) | bool) or
+              (nginx_gateway_install | default(false) | bool)
+            )
       shell: |
         set -euo pipefail
         curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
@@ -152,7 +305,8 @@
         creates: /usr/local/bin/helm
 
     - name: Install Cilium via Helm
-      when: node_role == "server"
+      tags: [platform]
+      when: node_role == "server" and (cilium_install | default(false) | bool)
       become: false
       shell: |
         set -euo pipefail
@@ -185,23 +339,43 @@
         exit 1
       args:
         executable: /bin/bash
-      register: cilium_install
-      changed_when: "'deployed' in cilium_install.stdout or 'installed' in cilium_install.stdout or 'upgraded' in cilium_install.stdout"
 
-    - name: Wait for Cilium to be ready
-      when: node_role == "server"
+    - name: Wait for Cilium daemonset
+      tags: [platform]
+      when: node_role == "server" and (cilium_install | default(false) | bool)
       become: false
       shell: |
         set -euo pipefail
         export KUBECONFIG=/home/vagrant/.kube/config
         k3s kubectl -n kube-system rollout status ds/cilium --timeout=3600s
+      args:
+        executable: /bin/bash
+
+    - name: Wait for Cilium envoy
+      tags: [platform]
+      when: node_role == "server" and (cilium_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
         k3s kubectl -n kube-system rollout status ds/cilium-envoy --timeout=3600s
+      args:
+        executable: /bin/bash
+
+    - name: Wait for Cilium operator
+      tags: [platform]
+      when: node_role == "server" and (cilium_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
         k3s kubectl -n kube-system rollout status deploy/cilium-operator --timeout=600s
       args:
         executable: /bin/bash
     
     - name: Configure Cilium LoadBalancer IP pool + L2 announcement policy
-      when: node_role == "server"
+      tags: [platform]
+      when: node_role == "server" and (cilium_install | default(false) | bool)
       become: false
       shell: |
         set -euo pipefail
@@ -229,14 +403,13 @@
         YAML
       args:
         executable: /bin/bash
-      register: cilium_lb_cfg
-      changed_when: "'configured' in cilium_lb_cfg.stdout or 'created' in cilium_lb_cfg.stdout"
 
 # ===================================================
 # Install Flux CD
 # ===================================================
 
     - name: Install Flux CLI
+      tags: [flux]
       when: node_role == "server" and (flux_install | default(true) | bool)
       shell: |
         set -euo pipefail
@@ -246,6 +419,7 @@
         creates: /usr/local/bin/flux
     
     - name: Check if flux-system namespace exists
+      tags: [flux]
       when: node_role == "server" and (flux_install | default(true) | bool)
       become: false
       shell: |
@@ -259,6 +433,7 @@
       changed_when: false
     
     - name: Install Flux controllers into the cluster
+      tags: [flux]
       when: node_role == "server" and (flux_install | default(true) | bool)
       become: false
       shell: |
@@ -269,6 +444,7 @@
         executable: /bin/bash
     
     - name: Wait for Flux controllers to be ready
+      tags: [flux]
       when: node_role == "server" and (flux_install | default(true) | bool)
       become: false
       shell: |
@@ -282,9 +458,660 @@
         executable: /bin/bash
     
     - name: Install Git
+      tags: [flux]
       when: node_role == "server" and (flux_install | default(true) | bool)
       apt:
         update_cache: true
         name: git
         state: present
+
+# ===================================================
+# Install Longhorn
+# ===================================================
+
+    - name: Install Longhorn Prerequisites
+      tags: [platform]
+      when: node_role == "server" and (longhorn_install | default(false) | bool)
+      apt:
+        update_cache: true
+        name:
+          - open-iscsi
+          - nfs-common
+          - cryptsetup
+          - dmsetup
+          - util-linux
+        state: present
     
+    - name: Enable and start iscsid
+      tags: [platform]
+      when: node_role == "server" and (longhorn_install | default(false) | bool)
+      systemd:
+        name: iscsid
+        enabled: true
+        state: started
+    
+    - name: Create Longhorn data directory
+      tags: [platform]
+      when: node_role == "server" and (longhorn_install | default(false) | bool)
+      file:
+        path: "{{ longhorn_default_data_path }}"
+        state: directory
+        mode: "0755"
+    
+    - name: Install Longhorn via Helm
+      tags: [platform]
+      when: node_role == "server" and (longhorn_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+
+        helm repo add longhorn {{ longhorn_helm_repo }}
+        helm repo update
+
+        VER=""
+        if [ -n "{{ longhorn_chart_version | default('') }}" ]; then
+          VER="--version {{ longhorn_chart_version }}"
+        fi
+
+        helm upgrade --install longhorn longhorn/longhorn \
+          --namespace {{ longhorn_namespace }} \
+          --create-namespace \
+          $VER \
+          --set defaultSettings.defaultDataPath={{ longhorn_default_data_path }} \
+          --set defaultSettings.defaultReplicaCount={{ longhorn_default_replica_count }}
+      args:
+        executable: /bin/bash
+      register: longhorn_install_result
+      changed_when: "'STATUS: deployed' in longhorn_install_result.stdout or 'STATUS: upgraded' in longhorn_install_result.stdout"
+
+    - name: Wait for Longhorn manager
+      tags: [platform]
+      when: node_role == "server" and (longhorn_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        k3s kubectl -n {{ longhorn_namespace }} rollout status ds/longhorn-manager --timeout=1600s
+      args:
+        executable: /bin/bash
+    
+    - name: Wait for Longhorn driver deployer
+      tags: [platform]
+      when: node_role == "server" and (longhorn_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        k3s kubectl -n {{ longhorn_namespace }} rollout status deploy/longhorn-driver-deployer --timeout=1600s
+      args:
+        executable: /bin/bash
+    
+    - name: Wait for Longhorn UI
+      tags: [platform]
+      when: node_role == "server" and (longhorn_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        k3s kubectl -n {{ longhorn_namespace }} rollout status deploy/longhorn-ui --timeout=1200s
+      args:
+        executable: /bin/bash
+
+# ===================================================
+# Install Cert Manager
+# ===================================================
+
+    - name: Install cert-manager via Helm
+      tags: [addons]
+      when: node_role == "server" and (cert_manager_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+
+        helm repo add jetstack {{ cert_manager_helm_repo }}
+        helm repo update
+
+        VER=""
+        if [ -n "{{ cert_manager_chart_version | default('') }}" ]; then
+          VER="--version {{ cert_manager_chart_version }}"
+        fi
+
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace {{ cert_manager_namespace }} \
+          --create-namespace \
+          $VER \
+          --set crds.enabled={{ cert_manager_install_crds | ternary('true', 'false') }}
+
+      args:
+        executable: /bin/bash
+    
+    - name: Wait for cert-manager deployments
+      tags: [addons]
+      when: node_role == "server" and (cert_manager_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        k3s kubectl -n {{ cert_manager_namespace }} rollout status deploy/cert-manager --timeout=600s
+        k3s kubectl -n {{ cert_manager_namespace }} rollout status deploy/cert-manager-cainjector --timeout=600s
+        k3s kubectl -n {{ cert_manager_namespace }} rollout status deploy/cert-manager-webhook --timeout=600s
+      args:
+        executable: /bin/bash
+
+# ===================================================
+# Install NGINX Gateway Fabric
+# ===================================================
+
+    - name: Install Gateway API CRDs for nginx-gateway
+      tags: [addons]
+      when: node_role == "server" and (nginx_gateway_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+
+        kubectl kustomize "https://github.com/nginx/nginx-gateway-fabric/config/crd/gateway-api/standard?ref={{ nginx_gateway_crd_version }}" | kubectl apply -f -
+      args:
+        executable: /bin/bash
+
+    - name: Install nginx-gateway via Helm
+      tags: [addons]
+      when: node_role == "server" and (nginx_gateway_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+
+        VER=""
+        if [ -n "{{ nginx_gateway_chart_version | default('') }}" ]; then
+          VER="--version {{ nginx_gateway_chart_version }}"
+        fi
+
+        helm upgrade --install nginx-gateway {{ nginx_gateway_helm_repo }} \
+          --namespace {{ nginx_gateway_namespace }} \
+          --create-namespace \
+          $VER \
+          --set service.type=LoadBalancer
+      args:
+        executable: /bin/bash
+    
+    - name: Wait for nginx-gateway deployment
+      tags: [addons]
+      when: node_role == "server" and (nginx_gateway_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        k3s kubectl -n {{ nginx_gateway_namespace }} rollout status deploy/nginx-gateway-nginx-gateway-fabric --timeout=900s
+      args:
+        executable: /bin/bash
+
+    - name: Apply GatewayClass
+      tags: [addons]
+      when: node_role == "server" and (nginx_gateway_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        k3s kubectl apply -f /vagrant/manifests/gateway-api/gateway-class.yaml
+      args:
+        executable: /bin/bash
+
+    - name: Apply Gateway
+      tags: [addons]
+      when: node_role == "server" and (nginx_gateway_install | default(false) | bool)
+      become: false
+      shell: |
+        set -euo pipefail
+        export KUBECONFIG=/home/vagrant/.kube/config
+        k3s kubectl apply -f /vagrant/manifests/gateway-api/gateway.yaml
+      args:
+        executable: /bin/bash
+
+
+# ===================================================
+# Copy manifests into vagrant home
+# ===================================================
+
+    - name: Ensure manifests destination directory exists
+      tags: [qol]
+      when: node_role == "server" and (manifests_copy_to_vm | default(false) | bool)
+      file:
+        path: "{{ manifests_dest_dir }}"
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: "0755"
+    
+    - name: Copy manifests tree into vagrant home
+      tags: [qol]
+      when: node_role == "server" and (manifests_copy_to_vm | default(false) | bool)
+      copy:
+        src: "{{ manifests_source_dir }}"
+        dest: "{{ manifests_dest_dir }}"
+        owner: vagrant
+        group: vagrant
+        mode: preserve
+        remote_src: true
+    
+    - name: Ensure .kube directory exists for vagrant
+      tags: [qol]
+      when: node_role == "server"
+      file:
+        path: /home/vagrant/.kube
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: "0700"
+    
+    - name: Refresh kubeconfig for vagrant user
+      tags: [qol]
+      when: node_role == "server"
+      shell: |
+        set -euo pipefail
+        cp -f /etc/rancher/k3s/k3s.yaml /home/vagrant/.kube/config
+        chown vagrant:vagrant /home/vagrant/.kube/config
+        sed -i 's/127.0.0.1/{{ control_plane_ip }}/g' /home/vagrant/.kube/config
+      args:
+        executable: /bin/bash
+
+# ===================================================
+# Developer QoL for vagrant user
+# ===================================================
+
+    - name: Install shell and CLI helper packages
+      tags: [qol]
+      when: shell_qol_install | default(false) | bool
+      apt:
+        update_cache: true
+        name:
+          - bash-completion
+          - curl
+          - git
+          - jq
+          - tree
+          - htop
+          - ripgrep
+          - vim
+        state: present
+
+    - name: Ensure vagrant config directories exist
+      tags: [qol]
+      file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "/home/vagrant/.config", mode: "0755" }
+        - { path: "/home/vagrant/bin", mode: "0755" }
+
+    - name: Ensure manifests destination directory exists for QoL sync
+      tags: [qol]
+      when: manifests_copy_to_vm | default(false) | bool
+      file:
+        path: "{{ manifests_dest_dir }}"
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: "0755"
+
+    - name: Copy manifests tree into vagrant home for QoL sync
+      tags: [qol]
+      when: manifests_copy_to_vm | default(false) | bool
+      copy:
+        src: "{{ manifests_source_dir }}/"
+        dest: "{{ manifests_dest_dir }}/"
+        owner: vagrant
+        group: vagrant
+        mode: preserve
+        remote_src: true
+
+    - name: Install Starship
+      tags: [qol]
+      when: starship_install | default(false) | bool
+      shell: |
+        set -euo pipefail
+        curl -fsSL https://starship.rs/install.sh | sh -s -- -y
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/starship
+
+    - name: Copy Starship config
+      tags: [qol]
+      when: starship_install | default(false) | bool
+      copy:
+        src: "{{ starship_config_source }}"
+        dest: "{{ starship_config_dest }}"
+        owner: vagrant
+        group: vagrant
+        mode: "0644"
+        remote_src: true
+
+    - name: Install kubectx and kubens
+      tags: [qol]
+      when: kubectx_install | default(false) | bool
+      git:
+        repo: https://github.com/ahmetb/kubectx.git
+        dest: /opt/kubectx
+        version: master
+
+    - name: Link kubectx and kubens binaries
+      tags: [qol]
+      when: kubectx_install | default(false) | bool
+      file:
+        src: "/opt/kubectx/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        state: link
+      loop:
+        - kubectx
+        - kubens
+
+    - name: Configure bashrc for vagrant user
+      tags: [qol]
+      blockinfile:
+        path: /home/vagrant/.bashrc
+        marker: "# {mark} ANSIBLE K3S HOMELAB"
+        owner: vagrant
+        group: vagrant
+        create: true
+        block: |
+          export KUBECONFIG=/home/vagrant/.kube/config
+          export EDITOR=vim
+          export PATH="$HOME/bin:$PATH"
+
+          alias k=kubectl
+          alias kgp='kubectl get pods -A -o wide'
+          alias kgs='kubectl get svc -A -o wide'
+          alias kgn='kubectl get nodes -o wide'
+          alias kctx='kubectx'
+          alias kns='kubens'
+
+          if [ -f /usr/share/bash-completion/bash_completion ]; then
+            source /usr/share/bash-completion/bash_completion
+          fi
+
+          if command -v kubectl >/dev/null 2>&1; then
+            source <(kubectl completion bash)
+            complete -F __start_kubectl k
+          fi
+
+          if [ -d /opt/kubectx/completion ]; then
+            [ -f /opt/kubectx/completion/kubens.bash ] && source /opt/kubectx/completion/kubens.bash
+            [ -f /opt/kubectx/completion/kubectx.bash ] && source /opt/kubectx/completion/kubectx.bash
+          fi
+
+          if [ -x /usr/local/bin/starship ]; then
+            eval "$(starship init bash)"
+          fi
+
+    - name: Create helper symlink for manifests
+      tags: [qol]
+      when: manifests_copy_to_vm | default(false) | bool
+      file:
+        src: "{{ manifests_dest_dir }}"
+        dest: /home/vagrant/manifests-current
+        state: link
+        owner: vagrant
+        group: vagrant
+
+# ===================================================
+# GitHub deploy-key repo bootstrap
+# ===================================================
+
+    - name: Ensure vagrant .ssh directory exists
+      tags: [qol]
+      when: node_role == "server" and (github_repo_clone | default(false) | bool)
+      file:
+        path: /home/vagrant/.ssh
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: "0700"
+
+    - name: Generate dedicated GitHub deploy key if missing
+      tags: [qol]
+      when: node_role == "server" and (github_repo_clone | default(false) | bool)
+      become: true
+      become_user: vagrant
+      community.crypto.openssh_keypair:
+        path: "{{ github_deploy_key_path }}"
+        type: ed25519
+        comment: "vagrant-homelab-deploy-key"
+        mode: "0600"
+
+    - name: Configure SSH for GitHub deploy key
+      tags: [qol]
+      when: node_role == "server" and (github_repo_clone | default(false) | bool)
+      blockinfile:
+        path: /home/vagrant/.ssh/config
+        create: true
+        owner: vagrant
+        group: vagrant
+        mode: "0600"
+        marker: "# {mark} ANSIBLE GITHUB DEPLOY KEY"
+        block: |
+          Host github.com
+            HostName github.com
+            User git
+            IdentityFile {{ github_deploy_key_path }}
+            IdentitiesOnly yes
+            AddKeysToAgent yes
+
+    - name: Read generated public deploy key
+      tags: [qol]
+      when: node_role == "server" and (github_repo_clone | default(false) | bool)
+      shell: cat {{ github_deploy_key_path }}.pub
+      register: github_repo_pubkey
+      changed_when: false
+
+    - name: Print deploy key for GitHub repo
+      tags: [qol]
+      when: node_role == "server" and (github_repo_clone | default(false) | bool)
+      debug:
+        msg:
+          - "Add this public key as a GitHub Deploy Key with write access on the target repo:"
+          - "{{ github_repo_pubkey.stdout }}"
+
+    - name: Configure global Git identity for vagrant
+      tags: [qol]
+      when: node_role == "server" and (github_repo_clone | default(false) | bool)
+      become: true
+      become_user: vagrant
+      shell: |
+        set -euo pipefail
+        git config --global user.name "{{ git_user_name }}"
+        git config --global user.email "{{ git_user_email }}"
+        git config --global init.defaultBranch main
+        git config --global pull.rebase false
+      args:
+        executable: /bin/bash
+
+    - name: Ensure ssh-agent startup is present in bashrc
+      tags: [qol]
+      when: node_role == "server" and (github_repo_clone | default(false) | bool)
+      blockinfile:
+        path: /home/vagrant/.bashrc
+        owner: vagrant
+        group: vagrant
+        create: true
+        marker: "# {mark} ANSIBLE SSH AGENT"
+        block: |
+          if [ -z "${SSH_AUTH_SOCK:-}" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+          fi
+          if [ -f "{{ github_deploy_key_path }}" ] && ! ssh-add -l 2>/dev/null | grep -q "{{ github_deploy_key_path | basename }}"; then
+            ssh-add "{{ github_deploy_key_path }}" >/dev/null 2>&1 || true
+          fi
+
+    - name: Start ssh-agent and add deploy key for current provisioning run
+      tags: [qol]
+      when: node_role == "server" and (github_repo_clone | default(false) | bool)
+      become: true
+      become_user: vagrant
+      shell: |
+        set -euo pipefail
+        eval "$(ssh-agent -s)"
+        ssh-add "{{ github_deploy_key_path }}"
+        ssh -o StrictHostKeyChecking=accept-new -T git@github.com || true
+      args:
+        executable: /bin/bash
+
+    - name: Ensure parent directory for repo exists
+      tags: [qol]
+      when: node_role == "server" and (github_repo_clone | default(false) | bool)
+      file:
+        path: "{{ github_repo_dest | dirname }}"
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: "0755"
+
+    - name: Clone target GitHub repo
+      tags: [qol]
+      when: node_role == "server" and (github_repo_clone | default(false) | bool)
+      become: true
+      become_user: vagrant
+      git:
+        repo: "{{ github_repo_ssh_url }}"
+        dest: "{{ github_repo_dest }}"
+        version: "{{ github_repo_branch }}"
+        accept_hostkey: true
+        key_file: "{{ github_deploy_key_path }}"
+        update: true
+
+    - name: Configure repo-local Git identity
+      tags: [qol]
+      when: node_role == "server" and (github_repo_clone | default(false) | bool)
+      become: true
+      become_user: vagrant
+      shell: |
+        set -euo pipefail
+        cd "{{ github_repo_dest }}"
+        git config user.name "{{ git_user_name }}"
+        git config user.email "{{ git_user_email }}"
+      args:
+        executable: /bin/bash
+
+# ===================================================
+# Initialize clean GitOps repo layout
+# ===================================================
+
+    - name: Ensure GitOps cluster directory exists
+      tags: [qol]
+      when:
+        - node_role == "server"
+        - (github_repo_clone | default(false) | bool)
+        - (gitops_repo_layout_init | default(false) | bool)
+      file:
+        path: "{{ gitops_cluster_dir }}"
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: "0755"
+
+    - name: Ensure standard GitOps subdirectories exist
+      tags: [qol]
+      when:
+        - node_role == "server"
+        - (github_repo_clone | default(false) | bool)
+        - (gitops_repo_layout_init | default(false) | bool)
+      file:
+        path: "{{ gitops_cluster_dir }}/{{ item }}"
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: "0755"
+      loop:
+        - base
+        - infra
+        - apps
+
+    - name: Sync copied manifests into GitOps cluster directory
+      tags: [qol]
+      when:
+        - node_role == "server"
+        - (github_repo_clone | default(false) | bool)
+        - (gitops_sync_manifests | default(false) | bool)
+        - (manifests_copy_to_vm | default(false) | bool)
+      shell: |
+        set -euo pipefail
+        rsync -a --delete "{{ manifests_dest_dir }}/" "{{ gitops_cluster_dir }}/"
+        chown -R vagrant:vagrant "{{ github_repo_dest }}"
+      args:
+        executable: /bin/bash
+
+    - name: Create README in GitOps cluster directory if missing
+      tags: [qol]
+      when:
+        - node_role == "server"
+        - (github_repo_clone | default(false) | bool)
+        - (gitops_repo_layout_init | default(false) | bool)
+      copy:
+        dest: "{{ gitops_cluster_dir }}/README.md"
+        owner: vagrant
+        group: vagrant
+        mode: "0644"
+        force: false
+        content: |
+          # k3s cluster manifests
+
+          This directory is populated from `/home/vagrant/manifests` during provisioning.
+
+          Suggested workflow inside the VM:
+          ```bash
+          rsync -a --delete ~/manifests/ ~/Gitops_Homelab/clusters/k3s/
+          cd ~/Gitops_Homelab
+          git status
+          git add .
+          git commit -m "Sync manifests"
+          git push origin main
+          ```
+
+    - name: Create sync helper script
+      tags: [qol]
+      when:
+        - node_role == "server"
+        - (github_repo_clone | default(false) | bool)
+        - (gitops_sync_manifests | default(false) | bool)
+      copy:
+        dest: /home/vagrant/bin/sync-manifests-to-gitops
+        owner: vagrant
+        group: vagrant
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          SRC="{{ manifests_dest_dir }}/"
+          DST="{{ gitops_cluster_dir }}/"
+
+          rsync -a --delete "$SRC" "$DST"
+          cd "{{ github_repo_dest }}"
+
+          echo "Synced manifests into $DST"
+          git status
+
+    - name: Create git push helper script
+      tags: [qol]
+      when:
+        - node_role == "server"
+        - (github_repo_clone | default(false) | bool)
+      copy:
+        dest: /home/vagrant/bin/gitops-push
+        owner: vagrant
+        group: vagrant
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          MSG="${1:-Sync manifests from VM}"
+
+          cd "{{ github_repo_dest }}"
+          git add .
+          git commit -m "$MSG" || true
+          git push origin "{{ github_repo_branch }}"

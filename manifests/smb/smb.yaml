@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: smb
+  labels:
+    gateway-access: "shared-web"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: samba-auth
+  namespace: smb
+type: Opaque
+stringData:
+  SAMBA_USER: files
+  SAMBA_PASS: password123
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-data
+  namespace: smb
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: longhorn-rwx-single
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: samba
+  namespace: smb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: samba
+  template:
+    metadata:
+      labels:
+        app: samba
+    spec:
+      containers:
+        - name: samba
+          image: dperson/samba:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - >
+              exec samba.sh -p
+              -u "${SAMBA_USER};${SAMBA_PASS}"
+              -s "shared;/shared;yes;no;no;${SAMBA_USER}"
+          envFrom:
+            - secretRef:
+                name: samba-auth
+          ports:
+            - name: smb
+              containerPort: 445
+              protocol: TCP
+            
+            - name: netbios-san
+              containerPort: 139
+              protocol: TCP
+          
+          volumeMounts:
+            - name: data
+              mountPath: /shared
+      
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: shared-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: samba
+  namespace: smb
+spec:
+  type: LoadBalancer
+  selector:
+    app: samba
+  ports:
+    - name: smb
+      port: 445
+      targetPort: 445
+      protocol: TCP
+    
+    - name: netbios-san
+      port: 139
+      targetPort: 139
+      protocol: TCP
